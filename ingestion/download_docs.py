@@ -33,6 +33,10 @@ DIRECT_PDFS = {
     "kyc_amendment_2025_08.pdf": "https://www.fidcindia.org.in/wp-content/uploads/2025/08/RBI-KYC-14-08-25.pdf",
     # RBI/2025-26/160 (December 29, 2025); the pdicai.org mirror now returns 404.
     "nbfc_kyc_amendment_2025_12.pdf": "https://rbidocs.rbi.org.in/rdocs/notification/PDFs/NT160A366EA8052104F0ABD04B9DAD153E3F9.PDF",
+    "nbfc_kyc_md_2025.pdf": "https://rbidocs.rbi.org.in/rdocs/notification/PDFs/361MD1E2F8EA063454AD5AFA1D02A1BA5ACA7.PDF",
+    "nbfc_responsible_business_conduct_2025.pdf": "https://rbidocs.rbi.org.in/rdocs/notification/PDFs/362MD26CA543937BA439A97E1BCFC08CF5808.PDF",
+    "nbfc_credit_facilities_2025.pdf": "https://rbidocs.rbi.org.in/rdocs/notification/PDFs/347MD5CC21D3597C04354B67A42A1A4CB439C.PDF",
+    "nbfc_outsourcing_2025.pdf": "https://rbidocs.rbi.org.in/rdocs/notification/PDFs/363MD40F22B0CDF734E3C884A9CBCE5DF9194.PDF",
 }
 
 # RBI pages containing a PDF link: (page url, title text to match or None for the first PDF).
@@ -40,10 +44,6 @@ PAGE_PDFS = {
     "digital_lending_directions_2025.pdf": (
         "https://www.rbi.org.in/Scripts/NotificationUser.aspx?Id=12848&Mode=0",
         None,
-    ),
-    "nbfc_kyc_md_2025.pdf": (
-        "https://www.rbi.org.in/scripts/BS_ViewMasterDirections.aspx",
-        "Reserve Bank of India (Non-Banking Financial Companies – Know Your Customer) Directions, 2025",
     ),
 }
 
