@@ -2,3 +2,6 @@
 __pycache__/
 .env
 data/raw/
+data/parsed/
+
+data/chunks/
