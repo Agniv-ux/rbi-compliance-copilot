@@ -8,10 +8,12 @@ import json
 import random
 import re
 import statistics
+import sys
 from collections import Counter
 from pathlib import Path
 
-MAX_CHARS = 3000
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from chunker import MAX_CHARS  # noqa: E402  (same limit the chunker uses)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("path")

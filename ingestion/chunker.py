@@ -19,7 +19,9 @@ PARSED_DIR = Path("data/parsed")
 CHUNK_DIR = Path("data/chunks")
 METADATA_CSV = Path("data/metadata.csv")
 
-MAX_CHARS = 3000
+# BGE embeds at most 512 tokens (~2,000 chars of RBI English); embed_and_load adds a
+# heading line, so chunk text stays well under that
+MAX_CHARS = 1800
 MIN_ROOM = 600  # when a big clause must be split, start it in the current part if this much space is left
 
 # ---------- patterns ----------
@@ -52,7 +54,7 @@ def annex_at_end(text):
 # "12." / "11A." at the start of an item (not "3.1", not a quoted "51A.")
 # (a bare "3." item also counts: Docling sometimes puts the number in its own item)
 # FAQ pages number questions "Q 8." / "Q.8." - treated the same as paragraph "8."
-PARA_RE = re.compile(r"^(?:Q\.?\s*)?(\d{1,3})([A-Z])?\.(?:\s+(?=\S)|$)")
+PARA_RE = re.compile(r"^(?:Q\.?\s*)?(\d{1,3})([A-Z])?\.(?:\s+(?=\S)|(?=[A-Z][a-z])|$)")  # also "4.These"
 # a paragraph number hidden inside an item, right after a sentence end
 # (may follow a sentence end or a run-in heading, and may be followed by a flattened footnote number)
 INLINE_PARA_RE = re.compile(r"(?<=[.;:a-z])\s+(\d{1,3})\.\s+(?=(?:\d{1,3}\s+)?[A-Z])")
@@ -266,7 +268,9 @@ class Paragraph:
 
 
 def para_title(p):
-    first = re.sub(r"^(?:Q\.?\s*)?\d{1,3}[A-Z]?\.\s+", "", p.lines[0][0]) if p.lines else ""
+    first = re.sub(r"^(?:Q\.?\s*)?\d{1,3}[A-Z]?\.\s*", "", p.lines[0][0]) if p.lines else ""
+    if not first and len(p.lines) > 1:
+        first = p.lines[1][0]  # the number was a bare "4." item; the text starts on the next line
     colon = first.find(":")
     if 0 < colon <= 150:
         return first[:colon].strip(" -–")
@@ -611,7 +615,7 @@ def chunk_document(doc, meta, doc_name):
                                 if p.region == region and p.chapter is None:
                                     p.para = None
                         prev_num, restart_ok = num, False
-                        header = re.sub(r"^(?:Q\.?\s*)?\d{1,3}[A-Z]?\.\s+", "", piece).rstrip(":") if label == "section_header" else None
+                        header = re.sub(r"^(?:Q\.?\s*)?\d{1,3}[A-Z]?\.\s*", "", piece).rstrip(":") if label == "section_header" else None
                         new_paragraph(f"{num}{suffix or ''}", header)
                         current.add(piece, page, as_new_line=True)
                         continue
