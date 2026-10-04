@@ -19,6 +19,13 @@ Scores, per question:
 The judge runs with reasoning effort "none", temperature 0 and a strict JSON schema, so the same
 input gets the same verdict.
 
+Routing (--routing):
+    none   (default, the honest run) - every question in "current" mode, as a user would ask it.
+    manual - clearly labelled hand routing that Step 6's agent should learn to do itself:
+             change questions in "compare" mode; status questions get the document-status record
+             (rag.status.get_document_status, hand-written query per question) as an extra source.
+             With --reuse <run A csv>, only routed questions are re-answered; the rest are copied.
+
 Outputs: eval/results/answers_<model>[_<tag>].csv per model, eval/results/answer_eval_summary[_<tag>].md.
 
 Usage:
@@ -26,6 +33,8 @@ Usage:
     python eval/answer_eval.py --models gpt-5.4-mini --limit 5
     python eval/answer_eval.py --models gpt-5.4-mini --tag v3_5A \
         --baseline eval/results/answers_gpt-5.4-mini.csv   # adds a before/after table
+    python eval/answer_eval.py --models gpt-5.4-mini --tag v4_5B_routed --routing manual \
+        --reuse eval/results/answers_gpt-5.4-mini_v4_5B.csv --baseline <csv> <csv>
 """
 import argparse
 import csv
@@ -40,7 +49,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "eval"))
 from rag import llm  # noqa: E402
-from rag.answer import NOT_COVERED, answer  # noqa: E402
+from rag.answer import NOT_COVERED, answer, source_block  # noqa: E402
+from rag.status import as_source, get_document_status  # noqa: E402
 from retrieval_eval import describe, matches, parse_targets  # noqa: E402
 
 QUESTIONS = ROOT / "eval" / "questions.csv"
@@ -49,6 +59,13 @@ TYPES = ("simple", "multi_part", "change", "status", "unanswerable")
 VERDICTS = ("correct", "partial", "incorrect")
 JUDGE_WORKERS = 6
 SAMPLE_SEED = 42
+
+# --routing manual: the document each status question is about, as an agent would name it
+STATUS_QUERIES = {
+    "q006": "Digital Lending Directions 2025",
+    "q007": "KYC Master Direction 2016",
+    "q043": "Digital Lending Directions 2025",
+}
 
 # ---- judge prompts ------------------------------------------------------------------------
 
@@ -126,9 +143,10 @@ def judge(system, user, schema):
 
 
 def format_cited(cited):
+    """The cited sources exactly as the answer model saw them (same header and text)."""
     if not cited:
         return "(the answer cites no sources)"
-    return "\n\n---\n\n".join(f"[{c['source']}] {c['title']} - {c['para']}\n{c['text'].strip()}" for c in cited)
+    return "\n\n---\n\n".join(source_block(c) for c in cited)
 
 
 def judge_correctness(row, ans, cited):
@@ -165,12 +183,24 @@ def fmt_sources(sources):
     return " || ".join(f"{s['source']} {s['doc']} {s['para']} p{s['pages']}" for s in sources)
 
 
-def answer_row(row, model):
-    r = answer(row["question"], model=model)  # defaults: k=5, statuses=("active",)
+def route(row, routing):
+    """(mode, extra_sources, label) for one question."""
+    if routing == "manual" and row["type"] == "change":
+        return "compare", None, "compare"
+    if routing == "manual" and row["type"] == "status" and row["id"] in STATUS_QUERIES:
+        st = get_document_status(STATUS_QUERIES[row["id"]])
+        if st["match"]:
+            return "current", [as_source(st["match"])], f"current+status({st['match']['file_name']})"
+    return "current", None, "current"
+
+
+def answer_row(row, model, routing="none"):
+    mode, extra, label = route(row, routing)
+    r = answer(row["question"], model=model, mode=mode, extra_sources=extra)  # defaults: k=5, active
     targets, unparsed = parse_targets(row)
     unanswerable = row["type"] == "unanswerable"
     return {
-        "id": row["id"], "type": row["type"], "question": row["question"],
+        "id": row["id"], "type": row["type"], "routing": label, "question": row["question"],
         "expected_answer": row["expected_answer"],
         "expected_source": "; ".join(describe(t) for t in targets) or "; ".join(unparsed),
         "answer": r["answer"],
@@ -244,22 +274,28 @@ def score_row(rec):
     return rec
 
 
-def run_model(rows, model):
-    print(f"\n== {model}: answering {len(rows)} questions", flush=True)
-    recs = []
-    for row in rows:  # sequential: search() shares one DB connection
-        recs.append(answer_row(row, model))
-        print(f"  {row['id']}: {'refused' if recs[-1]['exact_refusal'] else 'answered'}", flush=True)
+def run_model(rows, model, routing="none", reuse=None):
+    """reuse: {id: scored record} from an earlier run; questions that route to plain "current"
+    mode are copied from it instead of being answered again."""
+    todo = [r for r in rows if not (reuse and r["id"] in reuse and route(r, routing)[2] == "current")]
+    print(f"\n== {model}: answering {len(todo)} questions (routing={routing}; "
+          f"{len(rows) - len(todo)} copied from the reused run)", flush=True)
+    fresh = []
+    for row in todo:  # sequential: search() shares one DB connection
+        fresh.append(answer_row(row, model, routing))
+        print(f"  {row['id']}: {fresh[-1]['routing']:<45} "
+              f"{'refused' if fresh[-1]['exact_refusal'] else 'answered'}", flush=True)
     print(f"== {model}: judging with {llm.MODEL_JUDGE}", flush=True)
     with ThreadPoolExecutor(JUDGE_WORKERS) as pool:
-        recs = list(pool.map(score_row, recs))
+        scored = {r["id"]: r for r in pool.map(score_row, fresh)}
+    recs = [scored.get(r["id"]) or reuse[r["id"]] for r in rows]
     for rec in recs:
         print(f"  {rec['id']}: {rec['verdict']:<9} {rec['faithfulness'] or '-':<19} {rec['diagnosis']}")
     return recs
 
 
 def write_csv(recs, path):
-    fields = [k for k in recs[0] if not k.startswith("_")]
+    fields = list(dict.fromkeys(k for r in recs for k in r if not k.startswith("_")))
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -277,8 +313,13 @@ def load_csv(path):
         r.setdefault("exact_refusal", r.get("refused", 0))  # Step 4: refused == exact sentence
         for k in ("answer_cost_usd", "judge_cost_usd", "answer_seconds"):
             r[k] = float(r[k] or 0)
-        for k in ("answer_input_tokens", "answer_output_tokens"):
-            r[k] = int(r[k] or 0)
+        for k in ("answer_input_tokens", "answer_output_tokens", "answer_reasoning_tokens",
+                  "judge_input_tokens", "judge_output_tokens"):
+            if k in r:
+                r[k] = int(r[k] or 0)
+        for k in ("expected_in_top5", "all_expected_in_top5"):
+            if r.get(k) not in (None, ""):
+                r[k] = int(r[k])
     return recs
 
 
@@ -406,7 +447,7 @@ def judge_sample(recs, n=10):
     return "\n".join(out)
 
 
-def write_summary(all_recs, path, baseline=None):
+def write_summary(all_recs, path, baselines=(), routing="none"):
     first = next(iter(all_recs))
     parts = [
         "# Answer eval summary", "",
@@ -418,12 +459,17 @@ def write_summary(all_recs, path, baseline=None):
         "retrieval_miss when any expected paragraph is missing from the retrieved top 5, otherwise "
         "generation_error. Unanswerable questions count as correct when the answer refuses by meaning. "
         "Citation accuracy excludes rows whose expected source is not a paragraph (q007: metadata.csv).", "",
+        "**Routing: " + ("none - every question in default current mode, as a user would ask it.**" if routing == "none"
+                         else "MANUAL (not what a user gets) - change questions in compare mode; status questions "
+                              "with the document-status record as an extra source; everything else copied from "
+                              "the default run.**"), "",
     ]
-    if baseline:
-        name, recs = baseline
-        cols = {f"before ({name})": recs, **{f"after ({m})": r for m, r in all_recs.items()}}
-        parts += ["## Before / after", "", metric_table(cols), "",
-                  "Questions whose verdict or diagnosis changed:", "", changed_questions(recs, all_recs[first]), ""]
+    if baselines:
+        cols = {**{name: recs for name, recs in baselines}, **{f"this run ({m})": r for m, r in all_recs.items()}}
+        parts += ["## Before / after", "", metric_table(cols), ""]
+        for name, recs in baselines:
+            parts += [f"Questions whose verdict or diagnosis changed vs {name}:", "",
+                      changed_questions(recs, all_recs[first]), ""]
     if len(all_recs) > 1:
         parts += ["## Model comparison", "", metric_table(all_recs), ""]
     parts += [model_section(m, r) + "\n" for m, r in all_recs.items()]
@@ -436,7 +482,10 @@ def main():
     ap.add_argument("--models", nargs="+", default=[llm.MODEL, llm.MODEL_CHEAP])
     ap.add_argument("--limit", type=int, help="only the first N questions (smoke test)")
     ap.add_argument("--tag", help="suffix for the output files, e.g. v3_5A")
-    ap.add_argument("--baseline", type=Path, help="earlier answers_<model>.csv to compare the first model with")
+    ap.add_argument("--baseline", type=Path, nargs="+", default=[],
+                    help="earlier answers_<model>.csv file(s) to compare the first model with")
+    ap.add_argument("--routing", choices=["none", "manual"], default="none")
+    ap.add_argument("--reuse", type=Path, help="scored CSV whose plain current-mode rows are copied, not re-run")
     args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     if llm.MODEL_JUDGE in args.models:
@@ -445,21 +494,23 @@ def main():
     with QUESTIONS.open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))[: args.limit]
     suffix = f"_{args.tag}" if args.tag else ""
-    baseline = None
-    if args.baseline:
-        path = args.baseline if args.baseline.is_absolute() else ROOT / args.baseline
-        ids = {r["id"] for r in rows}
-        baseline = (path.stem, [r for r in load_csv(path) if r["id"] in ids])
+    ids = {r["id"] for r in rows}
+
+    def resolve(path):
+        return path if path.is_absolute() else ROOT / path
+
+    baselines = [(p.stem, [r for r in load_csv(resolve(p)) if r["id"] in ids]) for p in args.baseline]
+    reuse = {r["id"]: r for r in load_csv(resolve(args.reuse))} if args.reuse else None
 
     RESULTS.mkdir(parents=True, exist_ok=True)
     all_recs = {}
     for model in args.models:
-        all_recs[model] = run_model(rows, model)
+        all_recs[model] = run_model(rows, model, args.routing, reuse)
         out = RESULTS / f"answers_{model}{suffix}.csv"
         write_csv(all_recs[model], out)
         print(f"-> {out.relative_to(ROOT)}")
     summary = RESULTS / f"answer_eval_summary{suffix}.md"
-    write_summary(all_recs, summary, baseline)
+    write_summary(all_recs, summary, baselines, args.routing)
     print(f"-> {summary.relative_to(ROOT)}")
 
 
