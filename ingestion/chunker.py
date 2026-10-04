@@ -548,8 +548,12 @@ def chunk_document(doc, meta, doc_name):
             pending_title = False
             if (len(text) < 120 and not current.lines and not PARA_RE.match(text)
                     and not SECTION_RE.match(text) and not SUBSECTION_RE.match(text)):
-                chapter = f"{chapter} - {text.rstrip(':')}"  # "CHAPTER III" + "Customer Acceptance Policy"
+                # "CHAPTER III" + "Customer Acceptance Policy"; a title ending in a dash
+                # ("... Agreements -") continues on the next line
+                sep = " " if chapter.endswith(("-", "–")) else " - "
+                chapter = f"{chapter}{sep}{text.rstrip(':')}"
                 current.chapter = chapter
+                pending_title = text.endswith(("-", "–"))
                 continue
         if SUBSECTION_RE.match(text) and len(text) < 120 and label in ("section_header", "text"):
             new_paragraph()
