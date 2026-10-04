@@ -4,3 +4,4 @@ pgvector
 sentence-transformers
 python-dotenv
 pandas
+openai
