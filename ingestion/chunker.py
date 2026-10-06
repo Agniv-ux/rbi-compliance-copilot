@@ -85,6 +85,19 @@ BOILERPLATE_RE = re.compile(
     r"acknowledge (?:the )?receipt|yours faithfully|"
     r"for (?:your )?information and (?:necessary|appropriate) action", re.I)
 BOILERPLATE_MAX_CHARS = 300
+# lists of repealed / referenced circulars: rows with a circular reference number
+# ("03.10.42/2012-13", "RBI/2019-20/258") or numbered table rows ending in a date
+CIRCULAR_REF_RE = re.compile(r"\d{2}\.\d{2}\.\d{2,3}/\d{4}-\d{2}|RBI/\d{4}-\d{2}/\d+")
+CIRCULAR_ROW_RE = re.compile(
+    r"^\s*\d{1,3}\.\s*\|.*\|\s*(?:[A-Z][a-z]+\s+\d{1,2}\s*,\s*\d{4}|\d{2}\.\d{2}\.\d{4})\b")
+CIRCULAR_LIST_SHARE = 0.5
+
+
+def is_circular_list(text):
+    """True when most lines of a chunk are rows of a circular list (no rules, only references)."""
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("[")]
+    rows = sum(bool(CIRCULAR_REF_RE.search(ln) or CIRCULAR_ROW_RE.match(ln)) for ln in lines)
+    return len(lines) >= 3 and rows / len(lines) >= CIRCULAR_LIST_SHARE
 # placeholder left where RBI deleted a paragraph: "15. Deleted", "42. [Deleted]", "31. [*****]"
 DELETED_RE = re.compile(r"^(?:\d{1,3}[A-Z]?\.\s*)?(?:\d{1,3}\s*)?\[?\s*(?:Deleted|\*+)\s*\]?\.?\s*(?:\d{1,3})?$", re.I)
 
@@ -676,8 +689,9 @@ def chunk_document(doc, meta, doc_name):
                 "page_start": min(pages) if pages else None,
                 "page_end": max(pages) if pages else None,
                 "amendment_note": "; ".join(p.notes) or None,
-                "boilerplate": len(parts) == 1 and len(part) <= BOILERPLATE_MAX_CHARS
-                               and bool(BOILERPLATE_RE.search(part) or DELETED_RE.match(part)),
+                "boilerplate": (len(parts) == 1 and len(part) <= BOILERPLATE_MAX_CHARS
+                                and bool(BOILERPLATE_RE.search(part) or DELETED_RE.match(part)))
+                               or is_circular_list(part),
                 "text": part,
             })
     return chunks

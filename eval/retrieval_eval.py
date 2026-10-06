@@ -13,7 +13,8 @@ Reports Recall@1/3/5/10 overall and per type, the questions that missed the top 
 questions whose source could not be parsed. Per-question results go to
 eval/results/retrieval_baseline.csv.
 
-Usage: python eval/retrieval_eval.py [--out eval/results/<name>.csv]
+Usage: python eval/retrieval_eval.py [--method vector|keyword|hybrid] [--out eval/results/<name>.csv]
+       (eval/retrieval_ablation.py runs all three methods and compares them)
 """
 import argparse
 import csv
@@ -25,7 +26,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "retrieval"))
-from search import search, where  # noqa: E402
+from search import METHODS, search, where  # noqa: E402
 
 QUESTIONS = ROOT / "eval" / "questions.csv"
 OUT = ROOT / "eval" / "results" / "retrieval_baseline.csv"
@@ -90,15 +91,13 @@ def describe(target):
     return f"{target['doc']} {region}{paras}"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", type=Path, default=OUT, help="per-question results CSV")
-    out = ap.parse_args().out
-    out = out if out.is_absolute() else ROOT / out
-
+def load_rows():
     with QUESTIONS.open(encoding="utf-8") as f:
-        rows = [r for r in csv.DictReader(f) if r["type"] != "unanswerable"]
+        return [r for r in csv.DictReader(f) if r["type"] != "unanswerable"]
 
+
+def evaluate(rows, method="vector", verbose=True, ks=KS):
+    """(per-question results, unparseable rows) for one search method; Recall at each k in ks."""
     results, unparseable = [], []
     for row in rows:
         targets, unparsed = parse_targets(row)
@@ -106,21 +105,32 @@ def main():
             unparseable.append((row, unparsed))
             continue
         statuses = ("active",) if row["type"] in ACTIVE_ONLY_TYPES else None
-        hits = search(row["question"], k=max(KS), statuses=statuses)
+        hits = search(row["question"], k=max(ks), statuses=statuses, method=method)
         rank = next((i for i, h in enumerate(hits, 1) if any(matches(h, t) for t in targets)), None)
         # for two-source questions: were *all* sources found in the top 10?
         all_found = all(any(matches(h, t) for h in hits) for t in targets)
         results.append({
-            "id": row["id"], "type": row["type"], "question": row["question"],
+            "id": row["id"], "type": row["type"], "method": method, "question": row["question"],
             "expected": "; ".join(describe(t) for t in targets),
             "unparsed_part": "; ".join(unparsed),
             "statuses": "active" if statuses else "all",
             "rank": rank or "",
-            **{f"hit@{k}": int(bool(rank and rank <= k)) for k in KS},
+            **{f"hit@{k}": int(bool(rank and rank <= k)) for k in ks},
             "all_sources_in_top10": int(all_found),
             "top5": " || ".join(f"{h['doc']} {where(h)} ({h['score']:.3f})" for h in hits[:5]),
         })
-        print(f"  {row['id']}: rank {rank or '-'}", flush=True)
+        if verbose:
+            print(f"  {row['id']}: rank {rank or '-'}", flush=True)
+    return results, unparseable
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", type=Path, default=OUT, help="per-question results CSV")
+    ap.add_argument("--method", choices=METHODS, default="vector")
+    args = ap.parse_args()
+    out = args.out if args.out.is_absolute() else ROOT / args.out
+    results, unparseable = evaluate(load_rows(), args.method)
 
     # ---------- report ----------
     def recall_line(name, group):
@@ -128,7 +138,8 @@ def main():
         cells = "  ".join(f"R@{k} {sum(r[f'hit@{k}'] for r in group) / n:5.1%}" for k in KS)
         return f"{name:<11} n={n:<3} {cells}"
 
-    print(f"\nRetrieval eval -> {out.name} ({len(results)} questions scored, {len(unparseable)} not parseable)\n")
+    print(f"\nRetrieval eval [{args.method}] -> {out.name} ({len(results)} questions scored, "
+          f"{len(unparseable)} not parseable)\n")
     print(recall_line("overall", results))
     by_type = defaultdict(list)
     for r in results:

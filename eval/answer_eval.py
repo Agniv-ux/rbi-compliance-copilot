@@ -1,23 +1,25 @@
 """Answer-quality eval: run rag.answer.answer() on every question in eval/questions.csv and score it.
 
 For each question the system is called exactly as a user would (k=5, active documents only).
-Scores, per question:
-  1. correctness  - LLM judge (LLM_MODEL_JUDGE, default gpt-5.4) compares the answer with
-                    expected_answer + evidence_quote, and also sees the full text of the cited
-                    sources, so extra facts those sources support are not counted as wrong:
-                    correct / partial / incorrect. The same call says whether the answer is a
-                    refusal (declines the whole question), judged by meaning.
+Scores, per question (judges in eval/judges.py, JUDGE_PROVIDER / JUDGE_MODEL, e.g. Gemini Flash):
+  1. correctness  - each key fact (questions.csv key_facts) is present / missing / contradicted;
+                    the verdict is computed in code (all present = correct, some = partial,
+                    none or any contradicted = incorrect). Extra facts never count against the
+                    answer. The same call says whether the answer is a refusal (by meaning).
                     The exact refusal sentence needs no judge call.
   2. citation     - does any cited source match the expected doc + paragraph
                     (parsing and matching reused from eval/retrieval_eval.py; either target counts)?
   3. refusals     - unanswerable: correct if the answer refuses (by meaning); exact-sentence
                     refusals are reported separately. Answerable: refusal = false refusal.
-  4. faithfulness - second judge call: is every claim supported by the sources it cites?
+  4. faithfulness - is every claim supported by the sources it cites (header + text)?
   5. diagnosis    - for every non-correct answer: were ALL expected paragraphs in the retrieved
                     top 5? yes -> generation_error, any missing -> retrieval_miss.
 
-The judge runs with reasoning effort "none", temperature 0 and a strict JSON schema, so the same
-input gets the same verdict.
+Noise controls:
+  --judge-votes N  majority of N independent judge calls (default 1)
+  cache            answers and judge calls are cached in eval/cache/ (see eval/llm_cache.py) and
+                   reused on re-runs; --no-cache sends every call again
+  --repeat N       N full runs with the cache bypassed; reports mean and min-max per metric
 
 Routing (--routing):
     none   (default, the honest run) - every question in "current" mode, as a user would ask it.
@@ -26,20 +28,21 @@ Routing (--routing):
              (rag.status.get_document_status, hand-written query per question) as an extra source.
              With --reuse <run A csv>, only routed questions are re-answered; the rest are copied.
 
-Outputs: eval/results/answers_<model>[_<tag>].csv per model, eval/results/answer_eval_summary[_<tag>].md.
+Outputs: eval/results/answers_<model>[_<tag>].csv per model, eval/results/answer_eval_summary[_<tag>].md
+(--repeat: answers_<model>_<tag>_r<i>.csv and answer_eval_summary_<tag>_repeat.md).
 
 Usage:
-    python eval/answer_eval.py                          # gpt-5.4-mini and gpt-5.4-nano
-    python eval/answer_eval.py --models gpt-5.4-mini --limit 5
-    python eval/answer_eval.py --models gpt-5.4-mini --tag v3_5A \
-        --baseline eval/results/answers_gpt-5.4-mini.csv   # adds a before/after table
-    python eval/answer_eval.py --models gpt-5.4-mini --tag v4_5B_routed --routing manual \
-        --reuse eval/results/answers_gpt-5.4-mini_v4_5B.csv --baseline <csv> <csv>
+    python eval/answer_eval.py --limit 5
+    python eval/answer_eval.py --tag v5_5C --method hybrid --judge-votes 3 \\
+        --baseline eval/results/answers_gpt-5.4-mini_v4_5B.csv
+    python eval/answer_eval.py --tag v5_5C_routed --routing manual --judge-votes 3 \\
+        --reuse eval/results/answers_<model>_v5_5C.csv --baseline <csv> <csv>
+    python eval/answer_eval.py --tag v5_5C --repeat 3
 """
 import argparse
 import csv
-import json
 import random
+import statistics
 import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -48,15 +51,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "eval"))
+from judges import VERDICTS, Judge  # noqa: E402
+from llm_cache import CachedLLM  # noqa: E402
 from rag import llm  # noqa: E402
-from rag.answer import NOT_COVERED, answer, source_block  # noqa: E402
+from rag.answer import DEFAULT_METHOD, NOT_COVERED, answer  # noqa: E402
 from rag.status import as_source, get_document_status  # noqa: E402
 from retrieval_eval import describe, matches, parse_targets  # noqa: E402
+from search import METHODS  # noqa: E402
 
 QUESTIONS = ROOT / "eval" / "questions.csv"
 RESULTS = ROOT / "eval" / "results"
 TYPES = ("simple", "multi_part", "change", "status", "unanswerable")
-VERDICTS = ("correct", "partial", "incorrect")
 JUDGE_WORKERS = 6
 SAMPLE_SEED = 42
 
@@ -67,104 +72,12 @@ STATUS_QUERIES = {
     "q043": "Digital Lending Directions 2025",
 }
 
-# ---- judge prompts ------------------------------------------------------------------------
 
-CORRECTNESS_SYSTEM = """You grade answers from a question-answering system about RBI (Reserve Bank of India) regulations.
-
-You get: the question, the expected answer (written by a human expert), the evidence quote from the regulation that the expected answer is based on, the system's answer, and the full text of the sources the system cited.
-
-Decide whether the system's answer conveys the facts of the expected answer.
-- "correct": every key fact of the expected answer is present (numbers, periods, amounts, conditions, entities) and nothing in the answer contradicts the expected answer or the evidence.
-- "partial": no fact is wrong, but at least one key fact of the expected answer is missing or stated too vaguely (e.g. a qualifier like "at least" or a condition is dropped).
-- "incorrect": a key fact is wrong or contradicted, most of the expected answer is missing, or the system refused to answer.
-
-Rules:
-- Additional facts must NOT lower the verdict if they are correct: consistent with the evidence, or stated in the cited sources' text. Only missing facts, and facts that contradict the evidence or are not supported by any given text, count against the answer.
-- Judge meaning, not wording: "two years" = "2 years", "Rs 50,000" = "₹50,000", paraphrases are fine.
-- Ignore citation markers such as [S1].
-- missing_facts: key facts of the expected answer that the system's answer lacks (empty list if none).
-- wrong_facts: statements in the system's answer that contradict the expected answer or evidence, or that no given text supports (empty list if none).
-- refused: true only if the answer declines the whole question (e.g. says the information is not in the documents and gives no answer to it). An answer that answers part of the question and says another part is not covered is not a refusal.
-- reason: one or two sentences."""
-
-CORRECTNESS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "verdict": {"type": "string", "enum": list(VERDICTS)},
-        "missing_facts": {"type": "array", "items": {"type": "string"}},
-        "wrong_facts": {"type": "array", "items": {"type": "string"}},
-        "refused": {"type": "boolean"},
-        "reason": {"type": "string"},
-    },
-    "required": ["verdict", "missing_facts", "wrong_facts", "refused", "reason"],
-    "additionalProperties": False,
-}
-
-REFUSAL_SYSTEM = """A question-answering system about RBI regulations must refuse questions that its documents do not answer. The question below is NOT answered by its documents.
-
-Decide whether the system's answer refuses: it clearly says the documents do not provide this information, and it does not give a substantive answer to the question (no specific requirement, number, rule or recommendation presented as the answer). Mentioning what the documents do say about related topics is fine as long as it is not presented as the answer.
-
-refused: true if the answer refuses, false otherwise. reason: one sentence."""
-
-REFUSAL_SCHEMA = {
-    "type": "object",
-    "properties": {"refused": {"type": "boolean"}, "reason": {"type": "string"}},
-    "required": ["refused", "reason"],
-    "additionalProperties": False,
-}
-
-FAITHFULNESS_SYSTEM = """You check whether an answer is faithful to the sources it cites.
-
-You get an answer that contains citation markers like [S1], and the full text of each cited source.
-Split the answer into its factual claims. For each claim, check whether the source(s) cited for it (the marker(s) right after the claim, or at the end of the sentence or list) state it. A claim with no citation of its own is checked against the sources cited for its sentence or paragraph.
-
-- "supported": every claim is stated in, or directly follows from, the text of the sources it cites.
-- "partially_supported": most claims are supported, but at least one claim (or a number, period or condition in it) is not in its cited sources.
-- "unsupported": the main claim(s) are not in the cited sources.
-
-Judge only against the given source text, not against your own knowledge, even if a claim is true.
-unsupported_claims: the claims that are not supported (empty list if none). reason: one or two sentences."""
-
-FAITHFULNESS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "verdict": {"type": "string", "enum": ["supported", "partially_supported", "unsupported"]},
-        "unsupported_claims": {"type": "array", "items": {"type": "string"}},
-        "reason": {"type": "string"},
-    },
-    "required": ["verdict", "unsupported_claims", "reason"],
-    "additionalProperties": False,
-}
-
-
-def judge(system, user, schema):
-    r = llm.generate(system, user, model=llm.MODEL_JUDGE, temperature=0, json_schema=schema)
-    return json.loads(r["text"]), r
-
-
-def format_cited(cited):
-    """The cited sources exactly as the answer model saw them (same header and text)."""
-    if not cited:
-        return "(the answer cites no sources)"
-    return "\n\n---\n\n".join(source_block(c) for c in cited)
-
-
-def judge_correctness(row, ans, cited):
-    user = (f"Question: {row['question']}\n\n"
-            f"Expected answer: {row['expected_answer']}\n\n"
-            f"Evidence quote: {row['evidence_quote']}\n\n"
-            f"System answer:\n{ans}\n\n===\n\n"
-            f"Cited sources:\n\n{format_cited(cited)}")
-    return judge(CORRECTNESS_SYSTEM, user, CORRECTNESS_SCHEMA)
-
-
-def judge_refusal(row, ans):
-    return judge(REFUSAL_SYSTEM, f"Question: {row['question']}\n\nSystem answer:\n{ans}", REFUSAL_SCHEMA)
-
-
-def judge_faithfulness(ans, cited):
-    user = f"Answer:\n{ans}\n\n===\n\nCited sources:\n\n{format_cited(cited)}"
-    return judge(FAITHFULNESS_SYSTEM, user, FAITHFULNESS_SCHEMA)
+class Settings:
+    def __init__(self, method, votes, cache, faith_votes=None):
+        self.method, self.votes, self.faith_votes = method, votes, faith_votes or votes
+        self.answers = CachedLLM("answers", enabled=cache)
+        self.judge_calls = CachedLLM("judge", enabled=cache)
 
 
 # ---- per-question scoring -----------------------------------------------------------------
@@ -183,6 +96,10 @@ def fmt_sources(sources):
     return " || ".join(f"{s['source']} {s['doc']} {s['para']} p{s['pages']}" for s in sources)
 
 
+def fmt_ids(sources):
+    return " || ".join(f"{s['source']}={s['chunk_id'] or 'status:' + s['doc']}" for s in sources)
+
+
 def route(row, routing):
     """(mode, extra_sources, label) for one question."""
     if routing == "manual" and row["type"] == "change":
@@ -194,18 +111,20 @@ def route(row, routing):
     return "current", None, "current"
 
 
-def answer_row(row, model, routing="none"):
+def answer_row(row, model, routing, settings):
     mode, extra, label = route(row, routing)
-    r = answer(row["question"], model=model, mode=mode, extra_sources=extra)  # defaults: k=5, active
+    r = answer(row["question"], model=model, mode=mode, extra_sources=extra,  # defaults: k=5, active
+               method=settings.method, generate=settings.answers.generate)
     targets, unparsed = parse_targets(row)
     unanswerable = row["type"] == "unanswerable"
     return {
-        "id": row["id"], "type": row["type"], "routing": label, "question": row["question"],
-        "expected_answer": row["expected_answer"],
+        "id": row["id"], "type": row["type"], "routing": label, "method": r["method"],
+        "question": row["question"], "expected_answer": row["expected_answer"], "key_facts": row["key_facts"],
         "expected_source": "; ".join(describe(t) for t in targets) or "; ".join(unparsed),
         "answer": r["answer"],
         "exact_refusal": int(r["answer"].strip() == NOT_COVERED),
         "cited": fmt_sources(r["citations"]),
+        "cited_chunk_ids": fmt_ids(r["citations"]),
         "retrieved": fmt_sources(r["sources"]),
         "expected_in_top5": "" if not targets else int(any(found(r["sources"], t) for t in targets)),
         "all_expected_in_top5": "" if not targets else int(all(found(r["sources"], t) for t in targets)),
@@ -217,42 +136,34 @@ def answer_row(row, model, routing="none"):
     }
 
 
-def score_row(rec):
+def score_row(rec, settings):
     row, unanswerable, exact = rec["_row"], rec["type"] == "unanswerable", rec["exact_refusal"]
-    judge_in = judge_out = 0
-    judge_cost = 0.0
-
-    def add_usage(r):
-        nonlocal judge_in, judge_out, judge_cost
-        judge_in += r["input_tokens"]
-        judge_out += r["output_tokens"]
-        judge_cost += r["cost_usd"] or 0.0
+    judge = Judge(settings.judge_calls, votes=settings.votes, faith_votes=settings.faith_votes)
 
     # 1 + 3. correctness and refusal
     if unanswerable:
         if exact:
-            refused, reason = True, "exact refusal sentence"
+            j = {"refused": True, "reason": "exact refusal sentence", "agreement": 1.0}
         else:
-            j, r = judge_refusal(row, rec["answer"])
-            add_usage(r)
-            refused, reason = j["refused"], j["reason"]
-        c = {"verdict": "correct" if refused else "incorrect", "missing_facts": [], "wrong_facts": [],
-             "refused": refused, "reason": reason}
+            j = judge.refusal(row, rec["answer"])
+        c = {"verdict": "correct" if j["refused"] else "incorrect", "refused": j["refused"], "reason": j["reason"],
+             "facts_present": "", "missing_facts": [], "wrong_facts": [], "facts": [],
+             "agreement": j["agreement"], "votes": []}
     elif exact:
-        c = {"verdict": "incorrect", "missing_facts": [row["expected_answer"]], "wrong_facts": [],
-             "refused": True, "reason": "false refusal: the question is answerable from the documents"}
+        c = {"verdict": "incorrect", "refused": True,
+             "reason": "false refusal: the question is answerable from the documents",
+             "facts_present": f"0/{len(row['key_facts'].split('|'))}", "missing_facts": [row["key_facts"]],
+             "wrong_facts": [], "facts": [], "agreement": 1.0, "votes": []}
     else:
-        c, r = judge_correctness(row, rec["answer"], rec["_citations"])
-        add_usage(r)
+        c = judge.correctness(row, rec["answer"], rec["_citations"])
 
     # 4. faithfulness (only for answers that make claims)
     if c["refused"]:
-        f = {"verdict": "", "unsupported_claims": [], "reason": "refusal: nothing to check"}
+        f = {"verdict": "", "unsupported_claims": [], "reason": "refusal: nothing to check", "agreement": ""}
     elif not rec["_citations"]:
-        f = {"verdict": "unsupported", "unsupported_claims": [], "reason": "answer cites no sources"}
+        f = {"verdict": "unsupported", "unsupported_claims": [], "reason": "answer cites no sources", "agreement": ""}
     else:
-        f, r = judge_faithfulness(rec["answer"], rec["_citations"])
-        add_usage(r)
+        f = judge.faithfulness(rec["answer"], rec["_citations"])
 
     # 5. diagnosis
     if c["verdict"] == "correct":
@@ -264,33 +175,42 @@ def score_row(rec):
 
     rec.update({
         "refused": int(c["refused"]),
-        "verdict": c["verdict"], "missing_facts": "; ".join(c["missing_facts"]),
+        "verdict": c["verdict"], "facts_present": c["facts_present"],
+        "fact_statuses": " | ".join(f"{x['status']}" for x in c["facts"]),
+        "missing_facts": "; ".join(c["missing_facts"]),
         "wrong_facts": "; ".join(c["wrong_facts"]), "judge_reason": c["reason"],
+        "judge_agreement": c["agreement"], "judge_votes": " ".join(c["votes"]),
         "faithfulness": f["verdict"], "unsupported_claims": "; ".join(f["unsupported_claims"]),
-        "faithfulness_reason": f["reason"], "diagnosis": diagnosis,
-        "judge_input_tokens": judge_in, "judge_output_tokens": judge_out,
-        "judge_cost_usd": round(judge_cost, 6),
+        "faithfulness_reason": f["reason"], "faithfulness_agreement": f["agreement"],
+        "diagnosis": diagnosis,
+        "judge_input_tokens": sum(r["input_tokens"] for r in judge.usage),
+        "judge_output_tokens": sum(r["output_tokens"] for r in judge.usage),
+        "judge_cost_usd": round(judge.cost(), 6),
     })
     return rec
 
 
-def run_model(rows, model, routing="none", reuse=None):
+def run_model(rows, model, routing, settings, reuse=None):
     """reuse: {id: scored record} from an earlier run; questions that route to plain "current"
     mode are copied from it instead of being answered again."""
     todo = [r for r in rows if not (reuse and r["id"] in reuse and route(r, routing)[2] == "current")]
-    print(f"\n== {model}: answering {len(todo)} questions (routing={routing}; "
+    print(f"\n== {model}: answering {len(todo)} questions (routing={routing}, method={settings.method}; "
           f"{len(rows) - len(todo)} copied from the reused run)", flush=True)
     fresh = []
     for row in todo:  # sequential: search() shares one DB connection
-        fresh.append(answer_row(row, model, routing))
+        fresh.append(answer_row(row, model, routing, settings))
         print(f"  {row['id']}: {fresh[-1]['routing']:<45} "
               f"{'refused' if fresh[-1]['exact_refusal'] else 'answered'}", flush=True)
-    print(f"== {model}: judging with {llm.MODEL_JUDGE}", flush=True)
+    print(f"== {model}: judging with {llm.JUDGE_PROVIDER}/{llm.MODEL_JUDGE} "
+          f"(votes: correctness {settings.votes}, faithfulness {settings.faith_votes})", flush=True)
     with ThreadPoolExecutor(JUDGE_WORKERS) as pool:
-        scored = {r["id"]: r for r in pool.map(score_row, fresh)}
+        scored = {r["id"]: r for r in pool.map(lambda r: score_row(r, settings), fresh)}
     recs = [scored.get(r["id"]) or reuse[r["id"]] for r in rows]
     for rec in recs:
-        print(f"  {rec['id']}: {rec['verdict']:<9} {rec['faithfulness'] or '-':<19} {rec['diagnosis']}")
+        print(f"  {rec['id']}: {rec['verdict']:<9} {rec.get('facts_present', ''):<5} "
+              f"{rec['faithfulness'] or '-':<19} {rec['diagnosis']}")
+    print(f"   cache: answers {settings.answers.hits} hit / {settings.answers.misses} sent; "
+          f"judge {settings.judge_calls.hits} hit / {settings.judge_calls.misses} sent")
     return recs
 
 
@@ -307,7 +227,7 @@ def load_csv(path):
     with path.open(encoding="utf-8") as f:
         recs = list(csv.DictReader(f))
     for r in recs:
-        for k in ("refused", "exact_refusal", "citation_match"):
+        for k in ("refused", "exact_refusal", "citation_match", "expected_in_top5", "all_expected_in_top5"):
             if r.get(k) not in (None, ""):
                 r[k] = int(r[k])
         r.setdefault("exact_refusal", r.get("refused", 0))  # Step 4: refused == exact sentence
@@ -317,9 +237,6 @@ def load_csv(path):
                   "judge_input_tokens", "judge_output_tokens"):
             if k in r:
                 r[k] = int(r[k] or 0)
-        for k in ("expected_in_top5", "all_expected_in_top5"):
-            if r.get(k) not in (None, ""):
-                r[k] = int(r[k])
     return recs
 
 
@@ -337,6 +254,7 @@ def stats(recs):
     by_type = defaultdict(list)
     for r in recs:
         by_type[r["type"]].append(r)
+    agree = [float(r["judge_agreement"]) for r in recs if r.get("judge_agreement") not in (None, "")]
     n = len(recs)
     return {
         "n": n,
@@ -355,29 +273,44 @@ def stats(recs):
         "judge_cost": sum(r["judge_cost_usd"] for r in recs),
         "answer_tokens": (sum(r["answer_input_tokens"] for r in recs), sum(r["answer_output_tokens"] for r in recs)),
         "seconds": sum(r["answer_seconds"] for r in recs) / n,
+        "agreement": sum(agree) / len(agree) if agree else None,
     }
 
 
+def _share(num, den):
+    return num / den if den else None
+
+
+# (name, text cell, numeric value for --repeat)
 METRICS = [
-    ("correct (all)", lambda s: pct(s["verdicts"]["correct"], s["n"])),
-    ("partial (all)", lambda s: pct(s["verdicts"]["partial"], s["n"])),
-    ("incorrect (all)", lambda s: pct(s["verdicts"]["incorrect"], s["n"])),
-    *[(f"correct: {t}", lambda s, t=t: pct(s["by_type"].get(t, Counter())["correct"], s["type_n"].get(t, 0)))
-      for t in TYPES],
-    ("correct (answerable)", lambda s: pct(s["answerable_verdicts"]["correct"], s["n_answerable"])),
-    ("citation accuracy", lambda s: pct(*s["citation"])),
-    ("faithfulness: supported", lambda s: pct(s["faith"]["supported"], s["n_faith"])),
-    ("faithfulness: partially supported", lambda s: pct(s["faith"]["partially_supported"], s["n_faith"])),
-    ("faithfulness: unsupported", lambda s: pct(s["faith"]["unsupported"], s["n_faith"])),
-    ("refusal accuracy (by meaning)", lambda s: pct(*s["refusal"])),
-    ("refusal: exact sentence", lambda s: pct(*s["exact_refusal"])),
-    ("false-refusal rate", lambda s: pct(*s["false_refusal"])),
+    ("correct (all)", lambda s: pct(s["verdicts"]["correct"], s["n"]), lambda s: _share(s["verdicts"]["correct"], s["n"])),
+    ("partial (all)", lambda s: pct(s["verdicts"]["partial"], s["n"]), lambda s: _share(s["verdicts"]["partial"], s["n"])),
+    ("incorrect (all)", lambda s: pct(s["verdicts"]["incorrect"], s["n"]), lambda s: _share(s["verdicts"]["incorrect"], s["n"])),
+    *[(f"correct: {t}",
+       lambda s, t=t: pct(s["by_type"].get(t, Counter())["correct"], s["type_n"].get(t, 0)),
+       lambda s, t=t: _share(s["by_type"].get(t, Counter())["correct"], s["type_n"].get(t, 0))) for t in TYPES],
+    ("correct (answerable)", lambda s: pct(s["answerable_verdicts"]["correct"], s["n_answerable"]),
+     lambda s: _share(s["answerable_verdicts"]["correct"], s["n_answerable"])),
+    ("citation accuracy", lambda s: pct(*s["citation"]), lambda s: _share(*s["citation"])),
+    ("faithfulness: supported", lambda s: pct(s["faith"]["supported"], s["n_faith"]),
+     lambda s: _share(s["faith"]["supported"], s["n_faith"])),
+    ("faithfulness: partially supported", lambda s: pct(s["faith"]["partially_supported"], s["n_faith"]),
+     lambda s: _share(s["faith"]["partially_supported"], s["n_faith"])),
+    ("faithfulness: unsupported", lambda s: pct(s["faith"]["unsupported"], s["n_faith"]),
+     lambda s: _share(s["faith"]["unsupported"], s["n_faith"])),
+    ("refusal accuracy (by meaning)", lambda s: pct(*s["refusal"]), lambda s: _share(*s["refusal"])),
+    ("refusal: exact sentence", lambda s: pct(*s["exact_refusal"]), lambda s: _share(*s["exact_refusal"])),
+    ("false-refusal rate", lambda s: pct(*s["false_refusal"]), lambda s: _share(*s["false_refusal"])),
     ("retrieval_miss / generation_error",
-     lambda s: f"{s['diagnosis']['retrieval_miss']} / {s['diagnosis']['generation_error']}"),
-    ("answer tokens in / out (total)", lambda s: f"{s['answer_tokens'][0]:,} / {s['answer_tokens'][1]:,}"),
-    ("answering cost: total / per question", lambda s: f"${s['answer_cost']:.4f} / ${s['answer_cost'] / s['n']:.5f}"),
-    ("judging cost: total / per question", lambda s: f"${s['judge_cost']:.4f} / ${s['judge_cost'] / s['n']:.5f}"),
-    ("avg answer latency", lambda s: f"{s['seconds']:.2f}s"),
+     lambda s: f"{s['diagnosis']['retrieval_miss']} / {s['diagnosis']['generation_error']}", None),
+    ("judge agreement (share of votes = majority)",
+     lambda s: f"{s['agreement']:.1%}" if s["agreement"] is not None else "n/a", lambda s: s["agreement"]),
+    ("answer tokens in / out (total)", lambda s: f"{s['answer_tokens'][0]:,} / {s['answer_tokens'][1]:,}", None),
+    ("answering cost: total / per question", lambda s: f"${s['answer_cost']:.4f} / ${s['answer_cost'] / s['n']:.5f}",
+     lambda s: s["answer_cost"] / s["n"]),
+    ("judging cost: total / per question", lambda s: f"${s['judge_cost']:.4f} / ${s['judge_cost'] / s['n']:.5f}",
+     lambda s: s["judge_cost"] / s["n"]),
+    ("avg answer latency", lambda s: f"{s['seconds']:.2f}s", None),
 ]
 
 
@@ -385,7 +318,40 @@ def metric_table(columns):
     """columns: {header: list of records}"""
     S = {h: stats(r) for h, r in columns.items()}
     out = ["| metric | " + " | ".join(columns) + " |", "|---|" + "---|" * len(columns)]
-    out += [f"| {name} | " + " | ".join(fn(S[h]) for h in columns) + " |" for name, fn in METRICS]
+    out += [f"| {name} | " + " | ".join(fn(S[h]) for h in columns) + " |" for name, fn, _ in METRICS]
+    return "\n".join(out)
+
+
+def repeat_table(runs):
+    """runs: list of record lists -> per-metric run values, mean and min-max."""
+    S = [stats(r) for r in runs]
+    head = " | ".join(f"run {i}" for i in range(1, len(runs) + 1))
+    out = [f"| metric | {head} | mean | min-max |", "|---|" + "---|" * (len(runs) + 2)]
+    for name, _, num in METRICS:
+        if num is None:
+            continue
+        vals = [num(s) for s in S]
+        if any(v is None for v in vals):
+            continue
+        money = "cost" in name
+        fmt = (lambda v: f"${v:.5f}") if money else (lambda v: f"{v:.1%}")
+        out.append(f"| {name} | " + " | ".join(fmt(v) for v in vals)
+                   + f" | {fmt(statistics.mean(vals))} | {fmt(min(vals))} - {fmt(max(vals))} |")
+    diag = [f"{s['diagnosis']['retrieval_miss']} / {s['diagnosis']['generation_error']}" for s in S]
+    out.append("| retrieval_miss / generation_error | " + " | ".join(diag) + " | | |")
+    return "\n".join(out)
+
+
+def unstable_questions(runs):
+    by_id = defaultdict(list)
+    for recs in runs:
+        for r in recs:
+            by_id[r["id"]].append(r["verdict"])
+    rows = [(qid, v) for qid, v in by_id.items() if len(set(v)) > 1]
+    if not rows:
+        return "(none: every question got the same verdict in every run)"
+    out = ["| id | verdicts per run |", "|---|---|"]
+    out += [f"| {qid} | {' / '.join(v)} |" for qid, v in rows]
     return "\n".join(out)
 
 
@@ -424,11 +390,12 @@ def model_section(model, recs):
             f"- Cost: answering ${s['answer_cost']:.4f} total (${s['answer_cost'] / n:.5f}/question); "
             f"judging ${s['judge_cost']:.4f} total (${s['judge_cost'] / n:.5f}/question)",
             "", "Non-correct answers:", "",
-            "| id | type | verdict | diagnosis | judge reason |", "|---|---|---|---|---|"]
+            "| id | type | verdict | facts | diagnosis | judge reason |", "|---|---|---|---|---|---|"]
     for r in recs:
         if r["verdict"] != "correct":
             reason = r["judge_reason"].replace("|", "/").replace("\n", " ")
-            out.append(f"| {r['id']} | {r['type']} | {r['verdict']} | {r['diagnosis']} | {reason} |")
+            out.append(f"| {r['id']} | {r['type']} | {r['verdict']} | {r.get('facts_present', '')} | "
+                       f"{r['diagnosis']} | {reason} |")
     return "\n".join(out)
 
 
@@ -438,32 +405,41 @@ def judge_sample(recs, n=10):
     for r in sample:
         out += [f"### {r['id']} ({r['type']}) - {r['verdict']}", "",
                 f"- **Question:** {r['question']}",
-                f"- **Expected:** {r['expected_answer']}",
+                f"- **Key facts:** {r.get('key_facts') or '(unanswerable: must refuse)'}",
                 f"- **System answer:** {' '.join(r['answer'].split())}",
-                f"- **Verdict:** {r['verdict']}"
-                + (f" (missing: {r['missing_facts']})" if r["missing_facts"] else "")
-                + (f" (wrong: {r['wrong_facts']})" if r["wrong_facts"] else ""),
+                f"- **Fact statuses:** {r.get('fact_statuses') or '-'}",
+                f"- **Verdict:** {r['verdict']}",
                 f"- **Reason:** {r['judge_reason']}", ""]
     return "\n".join(out)
 
 
-def write_summary(all_recs, path, baselines=(), routing="none"):
-    first = next(iter(all_recs))
-    parts = [
+def header_lines(n, settings, routing):
+    return [
         "# Answer eval summary", "",
-        f"Questions: {QUESTIONS.relative_to(ROOT).as_posix()} ({len(all_recs[first])}). "
-        f"System called as a user would: k=5, active documents only. "
-        f"Judge: {llm.MODEL_JUDGE} (reasoning effort none, temperature 0, strict JSON schema); "
-        f"the correctness judge also sees the cited sources' text.", "",
+        f"Questions: {QUESTIONS.relative_to(ROOT).as_posix()} ({n}). System called as a user would: k=5, "
+        f"active documents only, retrieval method **{settings.method}**. Answers: {', '.join(sorted({llm.MODEL}))} "
+        f"(temperature 0). Judge: {llm.JUDGE_PROVIDER} {llm.MODEL_JUDGE} (lowest thinking level, temperature 0, "
+        f"structured JSON; majority of {settings.votes} call(s) for correctness, {settings.faith_votes} for "
+        "faithfulness); correctness = key facts present / missing / "
+        "contradicted, verdict computed in code.", "",
+        f"**Judge changed in Step 5C**: Step 5B (v4_5B) was graded by gpt-5.4 with a holistic verdict; this run "
+        f"is graded by {llm.JUDGE_PROVIDER} {llm.MODEL_JUDGE} checking key facts. Scores are therefore not directly "
+        "comparable to v4_5B: a change can come from the system or from the judge.", "",
         "Notes: partial and incorrect answers are both \"non-correct\" and get a diagnosis: "
         "retrieval_miss when any expected paragraph is missing from the retrieved top 5, otherwise "
         "generation_error. Unanswerable questions count as correct when the answer refuses by meaning. "
-        "Citation accuracy excludes rows whose expected source is not a paragraph (q007: metadata.csv).", "",
+        "Citation accuracy excludes rows whose expected source is not a paragraph (q007: metadata.csv). "
+        "Costs count cached calls at their original cost.", "",
         "**Routing: " + ("none - every question in default current mode, as a user would ask it.**" if routing == "none"
                          else "MANUAL (not what a user gets) - change questions in compare mode; status questions "
                               "with the document-status record as an extra source; everything else copied from "
                               "the default run.**"), "",
     ]
+
+
+def write_summary(all_recs, path, settings, baselines=(), routing="none"):
+    first = next(iter(all_recs))
+    parts = header_lines(len(all_recs[first]), settings, routing)
     if baselines:
         cols = {**{name: recs for name, recs in baselines}, **{f"this run ({m})": r for m, r in all_recs.items()}}
         parts += ["## Before / after", "", metric_table(cols), ""]
@@ -479,20 +455,29 @@ def write_summary(all_recs, path, baselines=(), routing="none"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", nargs="+", default=[llm.MODEL, llm.MODEL_CHEAP])
+    ap.add_argument("--models", nargs="+", default=[llm.MODEL])
     ap.add_argument("--limit", type=int, help="only the first N questions (smoke test)")
-    ap.add_argument("--tag", help="suffix for the output files, e.g. v3_5A")
+    ap.add_argument("--ids", nargs="+", help="only these question ids")
+    ap.add_argument("--tag", help="suffix for the output files, e.g. v5_5C")
     ap.add_argument("--baseline", type=Path, nargs="+", default=[],
                     help="earlier answers_<model>.csv file(s) to compare the first model with")
     ap.add_argument("--routing", choices=["none", "manual"], default="none")
     ap.add_argument("--reuse", type=Path, help="scored CSV whose plain current-mode rows are copied, not re-run")
+    ap.add_argument("--method", choices=METHODS, default=DEFAULT_METHOD, help="retrieval method")
+    ap.add_argument("--judge-votes", type=int, default=1, help="majority of N judge calls")
+    ap.add_argument("--faith-votes", type=int, help="votes for the faithfulness judge (default: --judge-votes)")
+    ap.add_argument("--no-cache", action="store_true", help="send every answer and judge call again")
+    ap.add_argument("--repeat", type=int, default=1, help="N runs with the cache bypassed; report mean / min-max")
     args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     if llm.MODEL_JUDGE in args.models:
-        sys.exit(f"judge model {llm.MODEL_JUDGE} is also being graded; pick a different LLM_MODEL_JUDGE")
+        sys.exit(f"judge model {llm.MODEL_JUDGE} is also being graded; pick a different JUDGE_MODEL")
 
     with QUESTIONS.open(encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))[: args.limit]
+        rows = list(csv.DictReader(f))
+    if args.ids:
+        rows = [r for r in rows if r["id"] in set(args.ids)]
+    rows = rows[: args.limit]
     suffix = f"_{args.tag}" if args.tag else ""
     ids = {r["id"] for r in rows}
 
@@ -501,16 +486,33 @@ def main():
 
     baselines = [(p.stem, [r for r in load_csv(resolve(p)) if r["id"] in ids]) for p in args.baseline]
     reuse = {r["id"]: r for r in load_csv(resolve(args.reuse))} if args.reuse else None
-
     RESULTS.mkdir(parents=True, exist_ok=True)
+
+    if args.repeat > 1:
+        model = args.models[0]
+        runs = []
+        for i in range(1, args.repeat + 1):
+            settings = Settings(args.method, args.judge_votes, cache=False, faith_votes=args.faith_votes)
+            print(f"\n######## repeat {i}/{args.repeat} (cache bypassed)")
+            runs.append(run_model(rows, model, args.routing, settings))
+            write_csv(runs[-1], RESULTS / f"answers_{model}{suffix}_r{i}.csv")
+        parts = header_lines(len(rows), settings, args.routing)
+        parts += [f"## Noise: {args.repeat} runs, cache bypassed ({model})", "", repeat_table(runs), "",
+                  "Questions whose verdict differs between runs:", "", unstable_questions(runs), ""]
+        out = RESULTS / f"answer_eval_summary{suffix}_repeat.md"
+        out.write_text("\n".join(parts), encoding="utf-8")
+        print(f"-> {out.relative_to(ROOT)}")
+        return
+
+    settings = Settings(args.method, args.judge_votes, cache=not args.no_cache, faith_votes=args.faith_votes)
     all_recs = {}
     for model in args.models:
-        all_recs[model] = run_model(rows, model, args.routing, reuse)
+        all_recs[model] = run_model(rows, model, args.routing, settings, reuse)
         out = RESULTS / f"answers_{model}{suffix}.csv"
         write_csv(all_recs[model], out)
         print(f"-> {out.relative_to(ROOT)}")
     summary = RESULTS / f"answer_eval_summary{suffix}.md"
-    write_summary(all_recs, summary, baselines, args.routing)
+    write_summary(all_recs, summary, settings, baselines, args.routing)
     print(f"-> {summary.relative_to(ROOT)}")
 
 

@@ -136,7 +136,8 @@ def get_document_status(name_or_query):
 def status_text(record):
     """Plain-text rendering of describe() output (used as a source for the answer model)."""
     lines = [f"Document: {record['title']} ({record['file_name']})",
-             f"Status: {record['status']}"]
+             f"Status: {record['status']}",
+             f"Status label: {status_label(record['file_name'])}"]
     if record["status_date"]:
         lines.append(f"Status date: {record['status_date']}")
     lines.append(f"Issue date: {record['issue_date'] or 'not recorded'}")
